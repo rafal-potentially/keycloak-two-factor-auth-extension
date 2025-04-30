@@ -7,6 +7,12 @@ Our project extends Keycloak with a custom RealmResourceProvider. This allows fo
 
 This extension also verifies that the target user is not service account for additional security check.
 
+## Build
+
+Build with
+
+`mvn clean package`
+
 ## APIs
 
 ### Validation
