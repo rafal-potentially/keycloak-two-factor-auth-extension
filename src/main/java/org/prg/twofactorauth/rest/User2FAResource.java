@@ -25,6 +25,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 
 public class User2FAResource {
 
@@ -127,14 +129,6 @@ public class User2FAResource {
                         .build();
             }
 
-            if (!isTotpEnabled()) {
-                return Response.status(Response.Status.BAD_REQUEST)
-                        .entity(createErrorResponse("TOTP is not enabled", CODE_TOTP_NOT_ENABLED))
-                        .build();
-            }
-
-            final RealmModel realm = session.getContext().getRealm();
-
             List<CredentialModel> totpCredentials = user.credentialManager()
                     .getStoredCredentialsByTypeStream(OTPCredentialModel.TYPE)
                     .collect(Collectors.toList());
@@ -145,19 +139,52 @@ public class User2FAResource {
                         .build();
             }
 
+            final RealmModel realm = session.getContext().getRealm();
+
+            TimeBasedOTP timeBasedOTP = new TimeBasedOTP(
+                    realm.getOTPPolicy().getAlgorithm(),
+                    realm.getOTPPolicy().getDigits(),
+                    realm.getOTPPolicy().getPeriod(),
+                    0);
+
             boolean validCode = false;
             for (CredentialModel credModel : totpCredentials) {
                 OTPCredentialModel otpCredential = OTPCredentialModel.createFromCredentialModel(credModel);
-                String secret = otpCredential.getSecretData();
-                TimeBasedOTP timeBasedOTP = new TimeBasedOTP(
-                        realm.getOTPPolicy().getAlgorithm(),
-                        realm.getOTPPolicy().getDigits(),
-                        realm.getOTPPolicy().getPeriod(),
-                        0);
 
-                if (timeBasedOTP.validateTOTP(data.getTotpCode(), secret.getBytes())) {
-                    validCode = true;
-                    break;
+                try {
+                    String secretData = otpCredential.getSecretData();
+
+                    try {
+                        JsonObject jsonData = JsonParser.parseString(secretData).getAsJsonObject();
+                        String secret = jsonData.get("value").getAsString();
+                        byte[] decodedSecret = Base32.decode(secret);
+
+                        if (timeBasedOTP.validateTOTP(data.getTotpCode(), decodedSecret)) {
+                            validCode = true;
+                            break;
+                        }
+                    } catch (Exception e) {
+                        System.out.println("JSON parsing failed, trying alternative method");
+                    }
+
+                    if (!validCode && timeBasedOTP.validateTOTP(data.getTotpCode(), secretData.getBytes())) {
+                        validCode = true;
+                        break;
+                    }
+
+                    try {
+                        String otpSecretData = otpCredential.getOTPSecretData().getValue();
+                        if (!validCode && timeBasedOTP.validateTOTP(data.getTotpCode(),
+                                otpSecretData != null ? otpSecretData.getBytes() : new byte[0])) {
+                            validCode = true;
+                            break;
+                        }
+                    } catch (Exception e) {
+                    }
+
+                } catch (Exception e) {
+                    e.printStackTrace();
+                    continue;
                 }
             }
 
@@ -171,7 +198,7 @@ public class User2FAResource {
                 try {
                     user.credentialManager().removeStoredCredentialById(cred.getId());
                 } catch (Exception e) {
-                    return Response.serverError()
+                    return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
                             .entity(createErrorResponse("Failed to disable TOTP", CODE_OPERATION_FAILED))
                             .build();
                 }
@@ -185,7 +212,8 @@ public class User2FAResource {
             }}).build();
 
         } catch (Exception e) {
-            return Response.serverError()
+            e.printStackTrace();
+            return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
                     .entity(createErrorResponse("Server error while disabling TOTP", CODE_SERVER_ERROR))
                     .build();
         }
