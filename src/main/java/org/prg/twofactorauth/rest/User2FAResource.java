@@ -86,6 +86,36 @@ public class User2FAResource {
 
     @POST
     @NoCache
+    @Path("submit-2fa")
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response register2FA(final TwoFactorAuthSubmission submission) {
+        if (!submission.isValid()) {
+            throw new BadRequestException("one or more data field for otp registration are blank");
+        }
+
+        final String encodedTotpSecret = submission.getEncodedTotpSecret();
+        final String totpSecret = new String(Base32.decode(encodedTotpSecret));
+        if (totpSecret.length() < TotpSecretLength) {
+            throw new BadRequestException("totp secret is invalid");
+        }
+
+        final RealmModel realm = this.session.getContext().getRealm();
+        final CredentialModel credentialModel = session.userCredentialManager().getStoredCredentialByNameAndType(realm, user, submission.getDeviceName(), OTPCredentialModel.TYPE);
+        if (credentialModel != null && !submission.isOverwrite()) {
+            throw new ForbiddenException("2FA is already configured for device: " + submission.getDeviceName());
+        }
+
+        final OTPCredentialModel otpCredentialModel = OTPCredentialModel.createFromPolicy(realm, totpSecret, submission.getDeviceName());
+        if (!CredentialHelper.createOTPCredential(this.session, realm, user, submission.getTotpInitialCode(), otpCredentialModel)) {
+            throw new BadRequestException("otp registration data is invalid");
+        }
+
+        return Response.noContent().build();
+    }
+
+    @POST
+    @NoCache
     @Path("disable-totp")
     @Consumes(MediaType.APPLICATION_JSON)
     @Produces(MediaType.APPLICATION_JSON)
