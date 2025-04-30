@@ -3,8 +3,8 @@ package org.prg.twofactorauth.rest;
 import org.jboss.resteasy.annotations.cache.NoCache;
 import org.keycloak.credential.CredentialModel;
 import org.keycloak.credential.CredentialProvider;
-import org.keycloak.models.OTPPolicy;
-import org.keycloak.models.utils.TimeBasedOTP;
+import org.keycloak.models.SubjectCredentialManager;
+import org.keycloak.utils.CredentialHelper;
 import org.prg.twofactorauth.dto.TwoFactorAuthSecretData;
 import org.prg.twofactorauth.dto.TwoFactorAuthSubmission;
 import org.prg.twofactorauth.dto.TwoFactorAuthVerificationData;
@@ -15,24 +15,22 @@ import org.keycloak.models.UserModel;
 import org.keycloak.models.credential.OTPCredentialModel;
 import org.keycloak.models.utils.Base32;
 import org.keycloak.models.utils.HmacOTP;
-import org.keycloak.utils.CredentialHelper;
 import org.keycloak.utils.TotpUtils;
 
 import javax.ws.rs.*;
 import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 
 public class User2FAResource {
 
 	private final KeycloakSession session;
     private final UserModel user;
-
+    final String CODE_SUCCESS          = "SUCCESS";
+    final String CODE_TOTP_NOT_ENABLED = "TOTP_NOT_ENABLED";
+    final String CODE_OPERATION_FAILED = "OPERATION_FAILED";
     public final int TotpSecretLength = 20;
 	
 	public User2FAResource(KeycloakSession session, UserModel user) {
@@ -121,127 +119,40 @@ public class User2FAResource {
     @Path("disable-totp")
     @Consumes(MediaType.APPLICATION_JSON)
     @Produces(MediaType.APPLICATION_JSON)
-    public Response disableTotpWithValidation(final TwoFactorAuthVerificationData data) {
-        try {
-            if (data == null || data.getTotpCode() == null || data.getTotpCode().isEmpty()) {
-                return Response.status(Response.Status.BAD_REQUEST)
-                        .entity(createErrorResponse("Invalid TOTP code", CODE_INVALID_CODE))
-                        .build();
-            }
-
-            List<CredentialModel> totpCredentials = user.credentialManager()
-                    .getStoredCredentialsByTypeStream(OTPCredentialModel.TYPE)
-                    .collect(Collectors.toList());
-
-            if (totpCredentials.isEmpty()) {
-                return Response.status(Response.Status.BAD_REQUEST)
-                        .entity(createErrorResponse("TOTP is not enabled", CODE_TOTP_NOT_ENABLED))
-                        .build();
-            }
-
-            final RealmModel realm = session.getContext().getRealm();
-
-            TimeBasedOTP timeBasedOTP = new TimeBasedOTP(
-                    realm.getOTPPolicy().getAlgorithm(),
-                    realm.getOTPPolicy().getDigits(),
-                    realm.getOTPPolicy().getPeriod(),
-                    0);
-
-            boolean validCode = false;
-            for (CredentialModel credModel : totpCredentials) {
-                OTPCredentialModel otpCredential = OTPCredentialModel.createFromCredentialModel(credModel);
-
-                try {
-                    String secretData = otpCredential.getSecretData();
-
-                    try {
-                        JsonObject jsonData = JsonParser.parseString(secretData).getAsJsonObject();
-                        String secret = jsonData.get("value").getAsString();
-                        byte[] decodedSecret = Base32.decode(secret);
-
-                        if (timeBasedOTP.validateTOTP(data.getTotpCode(), decodedSecret)) {
-                            validCode = true;
-                            break;
-                        }
-                    } catch (Exception e) {
-                        System.out.println("JSON parsing failed, trying alternative method");
-                    }
-
-                    if (!validCode && timeBasedOTP.validateTOTP(data.getTotpCode(), secretData.getBytes())) {
-                        validCode = true;
-                        break;
-                    }
-
-                    try {
-                        String otpSecretData = otpCredential.getOTPSecretData().getValue();
-                        if (!validCode && timeBasedOTP.validateTOTP(data.getTotpCode(),
-                                otpSecretData != null ? otpSecretData.getBytes() : new byte[0])) {
-                            validCode = true;
-                            break;
-                        }
-                    } catch (Exception e) {
-                    }
-
-                } catch (Exception e) {
-                    e.printStackTrace();
-                    continue;
-                }
-            }
-
-            if (!validCode) {
-                return Response.status(Response.Status.BAD_REQUEST)
-                        .entity(createErrorResponse("Invalid TOTP code", CODE_INVALID_TOTP))
-                        .build();
-            }
-
-            for (CredentialModel cred : totpCredentials) {
-                try {
-                    user.credentialManager().removeStoredCredentialById(cred.getId());
-                } catch (Exception e) {
-                    return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
-                            .entity(createErrorResponse("Failed to disable TOTP", CODE_OPERATION_FAILED))
-                            .build();
-                }
-            }
-
-            return Response.ok(new HashMap<String, Object>() {{
-                put("message", "TOTP validated and disabled successfully");
-                put("enabled", false);
-                put("userId", user.getId());
-                put("code", CODE_SUCCESS);
-            }}).build();
-
-        } catch (Exception e) {
-            e.printStackTrace();
-            return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
-                    .entity(createErrorResponse("Server error while disabling TOTP", CODE_SERVER_ERROR))
+    public Response disableTotp() {
+        SubjectCredentialManager credManager = user.credentialManager();
+        List<CredentialModel> totpCreds = credManager
+                .getStoredCredentialsByTypeStream(OTPCredentialModel.TYPE)
+                .collect(Collectors.toList());
+        if (totpCreds.isEmpty()) {
+            return Response.status(Response.Status.BAD_REQUEST)
+                    .entity(Map.of(
+                            "error", "TOTP is not enabled for this user",
+                            "code", CODE_TOTP_NOT_ENABLED
+                    ))
                     .build();
         }
+        try {
+            for (CredentialModel cred : totpCreds) {
+                boolean removed = credManager.removeStoredCredentialById(cred.getId());
+                if (!removed) {
+                    throw new RuntimeException("Failed to remove credential " + cred.getId());
+                }
+            }
+        } catch (Exception e) {
+            return Response.serverError()
+                    .entity(Map.of(
+                            "error", "Failed to disable TOTP",
+                            "code", CODE_OPERATION_FAILED
+                    ))
+                    .build();
+        }
+        return Response.ok(Map.of(
+                "message", "TOTP disabled successfully",
+                "enabled", false,
+                "userId", user.getId(),
+                "code", CODE_SUCCESS
+        )).build();
     }
 
-    private Map<String, Object> createErrorResponse(String message, int code) {
-        return new HashMap<String, Object>() {{
-            put("error", message);
-            put("code", code);
-        }};
-    }
-
-    private boolean isTotpEnabled() {
-        return user.credentialManager()
-                .getStoredCredentialsByTypeStream(OTPCredentialModel.TYPE)
-                .findAny()
-                .isPresent();
-    }
-
-    private static final int CODE_SUCCESS = 0;
-    private static final int CODE_INVALID_USER_ID = 1;
-    private static final int CODE_INVALID_CODE = 2;
-    private static final int CODE_TOTP_NOT_ENABLED = 3;
-    private static final int CODE_TOTP_ALREADY_ENABLED = 4;
-    private static final int CODE_SERVER_ERROR = 5;
-    private static final int CODE_TOTP_SETUP_REQUIRED = 6;
-    private static final int CODE_INVALID_TOTP = 7;
-    private static final int CODE_OPERATION_FAILED = 8;
-    private static final int CODE_UNAUTHORIZED = 9;
-    private static final int CODE_FORBIDDEN = 10;
 }
